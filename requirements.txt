@@ -1,0 +1,17 @@
+# ---- exécution ----
+streamlit>=1.33      
+requests>=2.31
+
+# ---- PDF ----
+PyPDF2>=3.0.1
+
+# ---- LangChain (scission officielle) ----
+pydantic>=2.11.4,<3      # requis par langchain-core ≥0.3.56
+langchain-core>=0.3.60,<0.4        # dernières API
+langchain-community>=0.3.24,<0.4   # version maxi dispo
+langchain-ollama>=0.3.3            # intègre OllamaLLM/OllamaEmbeddings
+langchain-text-splitters>=0.3.8    # utilitaires de découpe
+
+scikit-learn
+# ---- vector store ----
+faiss-cpu>=1.7.4
