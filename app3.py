@@ -1,309 +1,307 @@
+# rag_pdf_chat_streamlit.py – UI hiérarchique (correctif "False" + streaming)
+"""
+Application Streamlit « RAG PDF Chat » (version hiérarchique)
+
+Correctifs
+==========
+1. Bouton `False` qui s’affichait : la ligne `st.session_state.processing` sans assignation
+   affichait la valeur booléenne. Remplacé par un vrai `st.session_state.processing = True`.
+2. Streaming : ajout d’un buffer `collected_parts` pour afficher en temps réel
+   et concaténer la réponse finale.
+"""
+from __future__ import annotations
+
+import asyncio
 import os
 import tempfile
-from typing import List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import faiss  # type: ignore
 import numpy as np
 import streamlit as st
 from PyPDF2 import PdfReader
-import faiss
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sklearn.metrics.pairwise import cosine_similarity
 
-import asyncio
-from ollama import AsyncClient
-import ollama
+import ollama  # pip install ollama-python
 
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
-MODEL_NAME = "llama3.2:3b"  # Change here if you want to try a different Ollama model
-EMBEDDING_MODEL = "nomic-embed-text:latest"  # you can also set to a lighter/faster model
-TOP_K = 5               # final contexts given to the LLM
-CANDIDATES_K = 20       # initial retrieval set before MMR
-SIM_THRESHOLD = 0.25    # cosine similarity cut‑off
+# --------------------- UI & style -----------------------------------------
+st.set_page_config(page_title="🤖 RAG PDF Chat", page_icon="🤖", layout="wide")
 
-st.set_page_config(page_title="RAG PDF Chat • Ollama", page_icon="🤖")
-st.title("🤖📄 RAG PDF Chat – v2")
+st.markdown(
+    """
+<style>
+html, body{font-family:"Helvetica Neue",sans-serif}
+.user-msg{background:#d1e7dd;border-radius:8px;padding:0.8rem;margin:0.2rem 0}
+.bot-msg{background:#f8f9fa;border-radius:8px;padding:0.8rem;margin:0.2rem 0}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-# Sidebar controls ----------------------------------------------------------------
+# --------------------- Config ---------------------------------------------
+MODEL_NAME = "llama3.2:3b"
+EMBEDDING_MODEL = "nomic-embed-text:latest"
+DOC_TOP_K = 3
+CHUNK_TOP_K = 5
+CANDIDATES_K = 20
+NEIGHBORS = 1
+LAMBDA_DIVERSITY = 0.3
+SIM_THRESHOLD = 0.25
+TEMPERATURE = 0.2
+MAX_TOKENS = 2048
+
+# --------------------- Helpers LLM ----------------------------------------
+
+def _call_llm(messages: List[Dict[str, str]], *, temperature: float = 0.1, max_tokens: int = 2048, stream: bool = False):
+    return ollama.chat(
+        model=MODEL_NAME,
+        messages=messages,
+        stream=stream,
+        options={"temperature": temperature, "num_predict": max_tokens},
+    )
+
+
+def embed_texts(texts: List[str]) -> np.ndarray:
+    return np.array([ollama.embeddings(model=EMBEDDING_MODEL, prompt=t)["embedding"] for t in texts], dtype="float32")
+
+
+# --------------------- PDF utils -----------------------------------------
+
+def clean_text(text: str) -> str:
+    import re
+    text = re.sub(r"\n{2,}", "\n\n", text)
+    text = re.sub(r"(\w+)-\n(\w+)", r"\1\2", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+
+def extract_pdf_text(path: str) -> str:
+    return clean_text("\n".join(page.extract_text() or "" for page in PdfReader(path).pages))
+
+
+# --------------------- Chunking & résumé ----------------------------------
+
+def auto_chunk_size(tokens: int) -> int:
+    return 1024 if tokens < 8000 else 768 if tokens < 20000 else 512
+
+
+def chunk_document(text: str) -> List[str]:
+    size = auto_chunk_size(len(text.split()))
+    splitter = RecursiveCharacterTextSplitter(
+        separators=["\n\n", "\n", ". "],
+        chunk_size=size,
+        chunk_overlap=int(size*0.25),
+        length_function=len,
+    )
+    return [c for c in splitter.split_text(text) if len(c) > 100]
+
+
+def make_summary(text: str) -> str:
+    messages = [
+        {"role": "system", "content": "Vous êtes un expert en synthèse documentaire. Résumez le texte suivant en trois parties : "
+         "(1) Contexte, (2) Points clés, (3) Conclusions. Répondez en français."},
+        {"role": "user", "content": text[:120000]}
+    ]
+    return _call_llm(messages)["message"]["content"].strip()
+
+
+# --------------------- Index hiérarchique ---------------------------------
+class RagIndex:
+    def __init__(self):
+        self.doc_index: Optional[faiss.IndexFlatIP] = None
+        self.chunk_index: Optional[faiss.Index] = None
+        self.doc_meta: List[Dict[str, Any]] = []
+        self.chunk_meta: List[Dict[str, Any]] = []
+        self.chunk_emb: Optional[np.ndarray] = None
+
+    def build(self, uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile]):
+        doc_embs, chunk_embs_list = [], []
+        for doc_id, uf in enumerate(uploaded_files):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(uf.getbuffer())
+                path = tmp.name
+            full_text = extract_pdf_text(path)
+            os.unlink(path)
+
+            summary = make_summary(full_text)
+            self.doc_meta.append({"filename": uf.name, "summary": summary})
+            doc_embs.append(embed_texts([summary])[0])
+
+            chunks = chunk_document(full_text)
+            chunk_embs = embed_texts(chunks)
+            chunk_embs_list.append(chunk_embs)
+            for i, txt in enumerate(chunks):
+                self.chunk_meta.append({"doc_id": doc_id, "text": txt, "chunk_id": i})
+
+        self.doc_index = faiss.IndexFlatIP(len(doc_embs[0]))
+        self.doc_index.add(np.vstack(doc_embs).astype("float32"))
+
+        self.chunk_emb = np.vstack(chunk_embs_list).astype("float32")
+        self.chunk_index = faiss.IndexHNSWFlat(self.chunk_emb.shape[1], 32)
+        self.chunk_index.add(self.chunk_emb)
+
+    # ---------------- Recherche --------------------------------------
+    def _is_global(self, query: str, thr: float = 0.78) -> bool:
+        examples = [
+            "De quoi parle ce document ?",
+            "Quel est le sujet principal ?",
+            "Fais un résumé du document",
+        ]
+        emb_q = embed_texts([query])[0]
+        emb_ex = embed_texts(examples)
+        sims = emb_ex @ emb_q / (np.linalg.norm(emb_ex, axis=1) * np.linalg.norm(emb_q) + 1e-6)
+        return float(np.max(sims)) >= thr
+
+    def _mmr(self, q: np.ndarray, cand: np.ndarray, k: int) -> List[int]:
+        selected, rest = [], list(range(len(cand)))
+        while len(selected) < min(k, len(rest)):
+            best, best_score = None, -1e9
+            for idx in rest:
+                sim_q = float(q @ cand[idx] / (np.linalg.norm(q) * np.linalg.norm(cand[idx]) + 1e-6))
+                sim_s = max(cosine_similarity(cand[idx][None, :], cand[selected])[0]) if selected else 0.
+                score = LAMBDA_DIVERSITY*sim_q - (1-LAMBDA_DIVERSITY)*sim_s
+                if score > best_score:
+                    best, best_score = idx, score
+            selected.append(best)
+            rest.remove(best)
+        return selected
+
+    def retrieve(self, query: str) -> Tuple[List[str], List[int], Optional[str]]:
+        q_emb = embed_texts([query])[0]
+        _, I_doc = self.doc_index.search(q_emb[None, :], DOC_TOP_K)
+        allowed = set(I_doc[0])
+
+        mask = [i for i, m in enumerate(self.chunk_meta) if m["doc_id"] in allowed]
+        sub_emb = self.chunk_emb[mask]
+        sub_idx = faiss.IndexFlatIP(sub_emb.shape[1])
+        sub_idx.add(sub_emb)
+        D, I = sub_idx.search(q_emb[None, :], min(CANDIDATES_K, len(mask)))
+        pool = [mask[idx] for idx in I[0]]
+        pool = [idx for idx, d in zip(pool, D[0]) if 1-d <= SIM_THRESHOLD] or [mask[I[0][0]]]
+
+        cand_emb = self.chunk_emb[pool]
+        selected = [pool[i] for i in self._mmr(q_emb, cand_emb, CHUNK_TOP_K)]
+        expanded = {j for idx in selected for j in range(idx-NEIGHBORS, idx+NEIGHBORS+1)}
+        final = [i for i in expanded if 0 <= i < len(self.chunk_meta)][:CHUNK_TOP_K]
+
+        contexts = [self.chunk_meta[i]["text"] for i in final]
+        summary = self.doc_meta[int(I_doc[0][0])]["summary"] if self._is_global(query) else None
+        return contexts, final, summary
+
+
+# ---------------- Prompt builder -----------------------------------------
+
+def build_prompt(question: str, contexts: List[str], summary: Optional[str], history: List[Dict[str, str]] = None):
+    ctx_block = "\n\n".join(f"[{i+1}] {c}" for i, c in enumerate(contexts))
+    if summary:
+        ctx_block = f"[Résumé] {summary}\n\n" + ctx_block
+    
+    system = (
+        "Vous êtes un assistant expert. Utilisez uniquement les informations suivantes pour répondre en français. "
+        "Citez vos sources avec les balises [n]. Si l'information n'est pas trouvée, informez-en l'utilisateur."
+    )
+    
+    messages = [{"role": "system", "content": system}]
+    
+    # Ajouter l'historique des messages s'il existe
+    if history and len(history) > 0:
+        # On exclut la dernière question qui sera ajoutée après le contexte
+        previous_messages = history[:-1] if history[-1]["role"] == "user" else history
+        messages.extend(previous_messages)
+    
+    # Ajouter la question courante avec le contexte
+    current_user_content = f"CONTEXTE(S):\n{ctx_block}\n\nQUESTION: {question}\n\nRéponse:"
+    messages.append({"role": "user", "content": current_user_content})
+    
+    return messages
+
+
+# ---------------- Etat Streamlit ----------------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "rag" not in st.session_state:
+    st.session_state.rag: Optional[RagIndex] = None
+if "processing" not in st.session_state:
+    st.session_state.processing = False
+
+# ---------------- Sidebar upload ----------------------------------------
 with st.sidebar:
-    st.header("Paramètres")
-    temp = st.slider("Température", 0.0, 1.0, 0.1, 0.05)
-    max_tokens = st.slider("Max tokens", 64, 1024, 512, 64)
-    files = st.file_uploader("📚 Déposez vos PDF", type=["pdf"], accept_multiple_files=True)
+    st.header("📚 Documents")
+    files = st.file_uploader("Déposez vos PDF", type=["pdf"], accept_multiple_files=True)
     if st.button("🔄 Réinitialiser"):
         st.session_state.clear()
         st.rerun()
 
-# -----------------------------------------------------------------------------
-# Helper functions
-# -----------------------------------------------------------------------------
+# ---------------- Index construction ------------------------------------
+if files and st.session_state.rag is None:
+    with st.spinner("📄 Indexation en cours…"):
+        rag = RagIndex()
+        rag.build(files)
+        st.session_state.rag = rag
+    st.success(f"{len(files)} document(s) indexé(s) ! Posez vos questions.")
 
-def auto_chunk_size(total_tokens: int) -> int:
-    """Heuristic: bigger docs need smaller chunks to fit context window."""
-    # Increased minimum chunk sizes for better context
-    if total_tokens < 8_000:
-        return 750  # Increased from 400
-    if total_tokens < 20_000:
-        return 500  # Increased from 300
-    return 350  # Increased from 200
-
-
-def clean_text(text: str) -> str:
-    """Clean extracted text to fix common PDF extraction issues."""
-    import re
-    # Replace multiple newlines with a single one
-    text = re.sub(r'\n{2,}', '\n\n', text)
-    # Replace hyphenated words at line breaks (common PDF issue)
-    text = re.sub(r'(\w+)-\n(\w+)', r'\1\2', text)
-    # Fix spacing issues
-    text = re.sub(r'\s{2,}', ' ', text)
-    return text
-
-
-def extract_pdf_text(path: str) -> str:
-    """Extract and clean text from PDF."""
-    raw_text = "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
-    return clean_text(raw_text)
-
-
-def embed_texts(texts: List[str]) -> np.ndarray:
-    return np.array([
-        ollama.embeddings(model=EMBEDDING_MODEL, prompt=t)["embedding"] for t in texts
-    ], dtype="float32")
-
-
-def build_index(docs: List[Tuple[str, str]]):
-    """Split, embed & index uploaded documents. Returns FAISS index, chunks, embeddings, meta."""
-    all_chunks, meta = [], []
-    for fname, text in docs:
-        token_est = len(text.split())  # rough proxy
-        chunk_sz = auto_chunk_size(token_est)
-        
-        # Use better separator list that respects natural text boundaries
-        splitter = RecursiveCharacterTextSplitter(
-            separators=["\n\n", "\n", ". ", "! ", "? ", "；", "，", "。", " ", ""],
-            chunk_size=chunk_sz,
-            chunk_overlap=int(chunk_sz * 0.15),  # Increased overlap
-            length_function=len,
-            is_separator_regex=False,
+# ---------------- Message d'accueil et chat history -----------------------------------------
+if not st.session_state.messages:
+    # Message d'accueil si aucune discussion n'a commencé
+    if st.session_state.rag is not None:
+        st.markdown(
+            """
+            <div class="bot-msg">
+            👋 Bonjour ! Je suis votre assistant IA documentaire.
+            
+            Je peux vous aider à trouver des informations dans les documents que vous avez chargés.
+            Posez-moi une question sur le contenu de vos documents.
+            </div>
+            """,
+            unsafe_allow_html=True
         )
-        
-        chunks = splitter.split_text(text)
-        
-        # Filter out very short chunks (likely just fragments)
-        chunks = [c for c in chunks if len(c) > 50]
-        
-        for idx, chunk in enumerate(chunks):
-            all_chunks.append(chunk)
-            meta.append({"file": fname, "chunk_id": idx})
-    
-    # Add a debug message to see chunk statistics
-    if all_chunks:
-        avg_len = sum(len(c) for c in all_chunks) / len(all_chunks)
-        st.session_state.chunk_stats = {
-            "count": len(all_chunks),
-            "avg_length": avg_len,
-            "min_length": min(len(c) for c in all_chunks),
-            "max_length": max(len(c) for c in all_chunks),
-        }
-    
-    emb = embed_texts(all_chunks)
-    dim = emb.shape[1]
-    index = faiss.IndexHNSWFlat(dim, 32)
-    index.add(emb)
-    return index, all_chunks, emb, meta
-
-
-def mmr(query_emb: np.ndarray, emb: np.ndarray, top_k: int, lambda_diversity: float = 0.3):
-    selected, candidates = [], list(range(len(emb)))
-    while len(selected) < top_k and candidates:
-        best, best_score = None, -1e9
-        for idx in candidates:
-            sim_to_query = float(np.dot(query_emb, emb[idx]) / (np.linalg.norm(query_emb) * np.linalg.norm(emb[idx]) + 1e-6))
-            if selected:
-                sim_to_selected = max(
-                    cosine_similarity(emb[idx].reshape(1, -1), emb[selected])[0]
-                )
-            else:
-                sim_to_selected = 0.0
-            score = lambda_diversity * sim_to_query - (1 - lambda_diversity) * sim_to_selected
-            if score > best_score:
-                best, best_score = idx, score
-        selected.append(best)
-        candidates.remove(best)
-    return selected
-
-
-def retrieve(query: str):
-    query_emb = embed_texts([query])[0]
-    # coarse retrieval
-    D, I = st.session_state.faiss_index.search(query_emb.reshape(1, -1), CANDIDATES_K)
-    pool = [idx for idx in I[0] if idx < len(st.session_state.chunks)]
-    
-    # Debug information
-    st.session_state.debug_info = {
-        "total_chunks": len(st.session_state.chunks),
-        "retrieved_initial": len(pool),
-        "distances": D[0].tolist()[:5]  # Show top 5 distances
-    }
-    
-    # Make sure we have at least some context by loosening the filter if needed
-    if len(pool) > 0:
-        # similarity filter (only if we have enough contexts)
-        filtered_pool = [idx for idx in pool if D[0][list(I[0]).index(idx)] < (1 - SIM_THRESHOLD)]
-        if len(filtered_pool) >= 2:  # Only use filtered pool if we have enough results
-            pool = filtered_pool
-    
-    # If pool is empty after filtering, use the top 3 chunks regardless
-    if not pool and len(st.session_state.chunks) > 0:
-        pool = [I[0][i] for i in range(min(3, len(I[0]))) if I[0][i] < len(st.session_state.chunks)]
-    
-    # If still empty (unlikely), use the first chunk as fallback
-    if not pool and len(st.session_state.chunks) > 0:
-        pool = [0]  # Use the first chunk as a last resort
-        
-    # MMR rerank if we have a pool
-    if pool:
-        # Check if we have enough elements for MMR
-        if len(pool) >= 2:
-            selected = mmr(query_emb, st.session_state.embeddings[pool], min(TOP_K, len(pool)))
-            final_idxs = [pool[i] for i in selected]
-        else:
-            final_idxs = pool
-        return [(st.session_state.chunks[i], i) for i in final_idxs]
-    
-    # No chunks found (should never happen if docs were indexed)
-    return []
-
-
-def rag_prompt(question: str, contexts: List[Tuple[str, int]]):
-    if not contexts:
-        # Return a prompt asking the model to indicate no information is available
-        return [
-            {"role": "system", "content": "Vous êtes un assistant expert qui répond en français."},
-            {"role": "user", "content": f"Je n'ai pas d'information sur ce sujet dans ma base documentaire. Merci de répondre à l'utilisateur que vous n'avez pas d'information sur : {question}"}
-        ]
-    
-    ctx_block = "\n\n".join(f"[{idx+1}] {text}" for idx, (text, _) in enumerate(contexts))
-    system = (
-        "Vous êtes un assistant expert. Répondez en français en utilisant UNIQUEMENT les informations fournies "
-        "dans les contextes numérotés ci-dessous. N'inventez pas d'information. Référencez vos réponses avec les "
-        "numéros de contexte [n]. Si l'information n'est pas disponible dans les contextes, dites simplement "
-        "'Je ne trouve pas cette information dans les documents fournis.'"
-    )
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": f"CONTEXTES:\n{ctx_block}\n\nQUESTION: {question}\n\nRépondez uniquement à partir des contextes fournis:"}
-    ]
-
-
-async def stream_answer(messages):
-    client = st.session_state.async_client
-    try:
-        stream = await client.chat(
-            model=MODEL_NAME, 
-            messages=messages, 
-            stream=True, 
-            options={"temperature": temp, "num_predict": max_tokens}
+    else:
+        st.markdown(
+            """
+            <div class="bot-msg">
+            👋 Bienvenue dans RAG PDF Chat !
+            
+            Commencez par télécharger un ou plusieurs documents PDF dans le panneau latéral.
+            Une fois vos documents indexés, vous pourrez me poser des questions à leur sujet.
+            </div>
+            """,
+            unsafe_allow_html=True
         )
-        async for chunk in stream:
-            yield chunk["message"]["content"]
-    except Exception:
-        # fallback sync
-        resp = ollama.chat(
-            model=MODEL_NAME, 
-            messages=messages, 
-            stream=False, 
-            options={"temperature": temp, "num_predict": max_tokens}
-        )
-        yield resp["message"]["content"]
+else:
+    # Afficher l'historique des messages si une discussion a commencé
+    for msg in st.session_state.messages:
+        css = "user-msg" if msg["role"] == "user" else "bot-msg"
+        st.markdown(f'<div class="{css}">{msg["content"]}</div>', unsafe_allow_html=True)
 
-# -----------------------------------------------------------------------------
-# Session initialisation -------------------------------------------------------
-if "async_client" not in st.session_state:
-    st.session_state.async_client = AsyncClient()
+# ---------------- Chat input -------------------------------------------
+query = st.chat_input("Votre question…", disabled=st.session_state.processing or st.session_state.rag is None)
 
-if "faiss_index" not in st.session_state and files:
-    with st.spinner("🔢 Indexation des documents…"):
-        uploaded_docs = []
-        for uf in files:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(uf.getbuffer())
-                tmp_path = tmp.name
-            uploaded_docs.append((uf.name, extract_pdf_text(tmp_path)))
-            os.unlink(tmp_path)
-        
-        # Show preprocessing info
-        st.info(f"📄 Préparation de {len(uploaded_docs)} document(s)...")
-        
-        idx, chunks, emb, meta = build_index(uploaded_docs)
-        st.session_state.update(
-            faiss_index=idx, chunks=chunks, embeddings=emb, meta=meta, messages=[]
-        )
+if query:
+    st.session_state.messages.append({"role": "user", "content": query})
+    st.markdown(f'<div class="user-msg">{query}</div>', unsafe_allow_html=True)
+    st.session_state.processing = True  # <- correctif
 
-# -----------------------------------------------------------------------------
-# Chat interface ---------------------------------------------------------------
-if "faiss_index" not in st.session_state:
-    st.info("👈 Uploadez d'abord des PDF pour activer le chat.")
-    st.stop()
-
-# Show loaded documents indicator
-if files:
-    st.success(f"✅ {len(files)} document(s) chargé(s) et indexé(s)")
-    if "chunks" in st.session_state:
-        st.caption(f"Total de {len(st.session_state.chunks)} fragments extraits")
-        
-        # Add chunk stats to the UI
-        if "chunk_stats" in st.session_state:
-            stats = st.session_state.chunk_stats
-            with st.expander("📊 Statistiques des fragments"):
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Nombre", stats["count"])
-                col2.metric("Taille moyenne", f"{stats['avg_length']:.0f} chars")
-                col3.metric("Min", stats["min_length"])
-                col4.metric("Max", stats["max_length"])
-
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-if user_input := st.chat_input("Posez votre question…"):
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    contexts = retrieve(user_input)
+    rag: RagIndex = st.session_state.rag  # type: ignore
+    contexts, indices, summary = rag.retrieve(query)
     
-    # Debug information about retrieval
-    if "debug_info" in st.session_state:
-        with st.expander("🔍 Diagnostic de récupération", expanded=False):
-            st.write(f"Total de fragments disponibles: {st.session_state.debug_info['total_chunks']}")
-            st.write(f"Fragments initialement récupérés: {st.session_state.debug_info['retrieved_initial']}")
-            st.write(f"Distances des premiers résultats: {st.session_state.debug_info['distances']}")
-            st.write(f"Fragments finalement utilisés: {len(contexts)}")
-    
-    messages = rag_prompt(user_input, contexts)
+    # Passer l'historique complet des messages à la fonction build_prompt
+    prompt = build_prompt(query, contexts, summary, st.session_state.messages)
 
-    placeholder = st.chat_message("assistant").empty()
+    placeholder = st.empty()
+    collected_parts: List[str] = []
 
-    async def _runner():
-        collected = ""
-        async for token in stream_answer(messages):
-            collected += token
-            placeholder.markdown(collected)
-        st.session_state.messages.append({"role": "assistant", "content": collected})
+    # Stream the response directement avec l'historique complet
+    for chunk in _call_llm(prompt, temperature=TEMPERATURE, max_tokens=MAX_TOKENS, stream=True):
+        token = chunk["message"]["content"]
+        collected_parts.append(token)
+        placeholder.markdown(f'<div class="bot-msg">{"".join(collected_parts)}</div>', unsafe_allow_html=True)
+            
+    full_answer = "".join(collected_parts)
+    st.session_state.messages.append({"role": "assistant", "content": full_answer})
+    st.session_state.processing = False
 
-    asyncio.run(_runner())
-
-    with st.expander("📝 Contextes utilisés pour la réponse"):
-        if contexts:
-            for idx, (chunk, chunk_idx) in enumerate(contexts):
-                meta = st.session_state.meta[chunk_idx]
-                st.markdown(f"**[{idx+1}] {meta['file']} – chunk {meta['chunk_id']}**")
-                st.text_area(f"Contenu du fragment {idx+1}", chunk, height=150)
-        else:
-            st.warning("⚠️ Aucun contexte pertinent n'a été trouvé pour cette question.")
-
-st.write("---")
-st.caption("© 2025 – RAG powered by EY (TST tonio) • Streamlit v2")
+    # contexte utilisé
+    with st.expander("🔍 Contextes"):
+        for i, ctx in enumerate(contexts):
+            st.text_area(f"[{i+1}]", ctx, height=120)
