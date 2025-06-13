@@ -8,8 +8,6 @@ A ChatGPT-like interface for interacting with your PDF documents using Ollama an
 - 🤖 Chat with your documents using AI models from Ollama
 - 📊 RAG (Retrieval Augmented Generation) capabilities
 - 💬 Streaming responses for interactive chat experience
-- ⚙️ Adjustable model parameters (temperature, max tokens)
-- 📋 Export chat history to JSON
 
 ## Requirements
 
@@ -24,14 +22,13 @@ A ChatGPT-like interface for interacting with your PDF documents using Ollama an
    ```bash
    pip install -r requirements.txt
    ```
-3. Make sure Ollama is installed and running:
+3. Make sure Ollama is installed and running, if you have Ollama CLI use :
    ```bash
    ollama serve
    ```
 4. Pull the required models:
    ```bash
    ollama pull llama3.2:3b
-   ollama pull gemma3:12b
    ollama pull nomic-embed-text:latest
    ```
 
@@ -39,7 +36,7 @@ A ChatGPT-like interface for interacting with your PDF documents using Ollama an
 
 1. Start the application:
    ```bash
-   streamlit run app.py
+   streamlit run app3.py
    ```
    or 
       ```bash
@@ -48,12 +45,6 @@ A ChatGPT-like interface for interacting with your PDF documents using Ollama an
 2. Upload your PDF documents using the sidebar
 3. Click "Process PDFs" to analyze the documents
 4. Start asking questions about your documents in the chat input
-
-## Model Configuration
-
-- Choose between different LLM models (llama3.2:3b, gemma3:12b)
-- Adjust temperature to control randomness (higher = more creative, lower = more deterministic)
-- Set maximum token length for responses
 
 ## Troubleshooting
 

@@ -1,14 +1,3 @@
-# rag_pdf_chat_streamlit.py – UI hiérarchique (correctif "False" + streaming)
-"""
-Application Streamlit « RAG PDF Chat » (version hiérarchique)
-
-Correctifs
-==========
-1. Bouton `False` qui s’affichait : la ligne `st.session_state.processing` sans assignation
-   affichait la valeur booléenne. Remplacé par un vrai `st.session_state.processing = True`.
-2. Streaming : ajout d’un buffer `collected_parts` pour afficher en temps réel
-   et concaténer la réponse finale.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -31,9 +20,42 @@ st.set_page_config(page_title="🤖 RAG PDF Chat", page_icon="🤖", layout="wid
 st.markdown(
     """
 <style>
-html, body{font-family:"Helvetica Neue",sans-serif}
-.user-msg{background:#d1e7dd;border-radius:8px;padding:0.8rem;margin:0.2rem 0}
-.bot-msg{background:#f8f9fa;border-radius:8px;padding:0.8rem;margin:0.2rem 0}
+html, body {
+    font-family: 'Helvetica Neue', sans-serif;
+    background-color: #f4f7fa;
+}
+.sidebar .sidebar-content {
+    background-color: #ffffff;
+}
+.chat-container {
+    max-width: 1200px;
+    margin: auto;
+    padding: 1rem;
+}
+.user-msg {
+    background: #007bff;
+    color: white;
+    border-radius: 20px 20px 0px 20px;
+    padding: 1rem;
+    margin: 0.5rem 0;
+    align-self: flex-end;
+    max-width: 100%;
+    word-wrap: break-word;
+}
+.bot-msg {
+    background: #e9ecef;
+    color: #212529;
+    border-radius: 20px 20px 20px 0px;
+    padding: 1rem;
+    margin: 0.5rem 0;
+    align-self: flex-start;
+    max-width: 100%;
+    word-wrap: break-word;
+}
+.chat-area {
+    display: flex;
+    flex-direction: column;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -65,7 +87,6 @@ def _call_llm(messages: List[Dict[str, str]], *, temperature: float = 0.1, max_t
 def embed_texts(texts: List[str]) -> np.ndarray:
     return np.array([ollama.embeddings(model=EMBEDDING_MODEL, prompt=t)["embedding"] for t in texts], dtype="float32")
 
-
 # --------------------- PDF utils -----------------------------------------
 
 def clean_text(text: str) -> str:
@@ -78,7 +99,6 @@ def clean_text(text: str) -> str:
 
 def extract_pdf_text(path: str) -> str:
     return clean_text("\n".join(page.extract_text() or "" for page in PdfReader(path).pages))
-
 
 # --------------------- Chunking & résumé ----------------------------------
 
@@ -99,12 +119,10 @@ def chunk_document(text: str) -> List[str]:
 
 def make_summary(text: str) -> str:
     messages = [
-        {"role": "system", "content": "Vous êtes un expert en synthèse documentaire. Résumez le texte suivant en trois parties : "
-         "(1) Contexte, (2) Points clés, (3) Conclusions. Répondez en français."},
+        {"role": "system", "content": "Vous êtes un expert en synthèse documentaire. Résumez le texte suivant en trois parties : (1) Contexte, (2) Points clés, (3) Conclusions. Répondez en français."},
         {"role": "user", "content": text[:120000]}
     ]
     return _call_llm(messages)["message"]["content"].strip()
-
 
 # --------------------- Index hiérarchique ---------------------------------
 class RagIndex:
@@ -141,7 +159,6 @@ class RagIndex:
         self.chunk_index = faiss.IndexHNSWFlat(self.chunk_emb.shape[1], 32)
         self.chunk_index.add(self.chunk_emb)
 
-    # ---------------- Recherche --------------------------------------
     def _is_global(self, query: str, thr: float = 0.78) -> bool:
         examples = [
             "De quoi parle ce document ?",
@@ -189,9 +206,7 @@ class RagIndex:
         summary = self.doc_meta[int(I_doc[0][0])]["summary"] if self._is_global(query) else None
         return contexts, final, summary
 
-
 # ---------------- Prompt builder -----------------------------------------
-
 def build_prompt(question: str, contexts: List[str], summary: Optional[str], history: List[Dict[str, str]] = None):
     ctx_block = "\n\n".join(f"[{i+1}] {c}" for i, c in enumerate(contexts))
     if summary:
@@ -204,18 +219,14 @@ def build_prompt(question: str, contexts: List[str], summary: Optional[str], his
     
     messages = [{"role": "system", "content": system}]
     
-    # Ajouter l'historique des messages s'il existe
     if history and len(history) > 0:
-        # On exclut la dernière question qui sera ajoutée après le contexte
         previous_messages = history[:-1] if history[-1]["role"] == "user" else history
         messages.extend(previous_messages)
     
-    # Ajouter la question courante avec le contexte
     current_user_content = f"CONTEXTE(S):\n{ctx_block}\n\nQUESTION: {question}\n\nRéponse:"
     messages.append({"role": "user", "content": current_user_content})
     
     return messages
-
 
 # ---------------- Etat Streamlit ----------------------------------------
 if "messages" not in st.session_state:
@@ -241,17 +252,15 @@ if files and st.session_state.rag is None:
         st.session_state.rag = rag
     st.success(f"{len(files)} document(s) indexé(s) ! Posez vos questions.")
 
-# ---------------- Message d'accueil et chat history -----------------------------------------
+# ---------------- Chat display -----------------------------------------
+st.markdown("<div class='chat-container'>", unsafe_allow_html=True)
 if not st.session_state.messages:
-    # Message d'accueil si aucune discussion n'a commencé
     if st.session_state.rag is not None:
         st.markdown(
             """
             <div class="bot-msg">
             👋 Bonjour ! Je suis votre assistant IA documentaire.
-            
-            Je peux vous aider à trouver des informations dans les documents que vous avez chargés.
-            Posez-moi une question sur le contenu de vos documents.
+            <br>Posez-moi une question sur le contenu de vos documents.
             </div>
             """,
             unsafe_allow_html=True
@@ -261,47 +270,45 @@ if not st.session_state.messages:
             """
             <div class="bot-msg">
             👋 Bienvenue dans RAG PDF Chat !
-            
-            Commencez par télécharger un ou plusieurs documents PDF dans le panneau latéral.
-            Une fois vos documents indexés, vous pourrez me poser des questions à leur sujet.
+            <br>Commencez par télécharger un ou plusieurs documents PDF dans le panneau latéral.
             </div>
             """,
             unsafe_allow_html=True
         )
 else:
-    # Afficher l'historique des messages si une discussion a commencé
+    st.markdown("<div class='chat-area'>", unsafe_allow_html=True)
     for msg in st.session_state.messages:
         css = "user-msg" if msg["role"] == "user" else "bot-msg"
         st.markdown(f'<div class="{css}">{msg["content"]}</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------- Chat input -------------------------------------------
 query = st.chat_input("Votre question…", disabled=st.session_state.processing or st.session_state.rag is None)
 
 if query:
     st.session_state.messages.append({"role": "user", "content": query})
+    # Réafficher l'entrée de l'utilisateur dans le style amélioré
     st.markdown(f'<div class="user-msg">{query}</div>', unsafe_allow_html=True)
     st.session_state.processing = True  # <- correctif
 
     rag: RagIndex = st.session_state.rag  # type: ignore
     contexts, indices, summary = rag.retrieve(query)
     
-    # Passer l'historique complet des messages à la fonction build_prompt
     prompt = build_prompt(query, contexts, summary, st.session_state.messages)
 
     placeholder = st.empty()
     collected_parts: List[str] = []
 
-    # Stream the response directement avec l'historique complet
     for chunk in _call_llm(prompt, temperature=TEMPERATURE, max_tokens=MAX_TOKENS, stream=True):
         token = chunk["message"]["content"]
         collected_parts.append(token)
         placeholder.markdown(f'<div class="bot-msg">{"".join(collected_parts)}</div>', unsafe_allow_html=True)
-            
+
     full_answer = "".join(collected_parts)
     st.session_state.messages.append({"role": "assistant", "content": full_answer})
     st.session_state.processing = False
 
-    # contexte utilisé
     with st.expander("🔍 Contextes"):
         for i, ctx in enumerate(contexts):
             st.text_area(f"[{i+1}]", ctx, height=120)
