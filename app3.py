@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import os
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
@@ -232,7 +231,7 @@ def build_prompt(question: str, contexts: List[str], summary: Optional[str], his
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "rag" not in st.session_state:
-    st.session_state.rag: Optional[RagIndex] = None
+    st.session_state.rag = None
 if "processing" not in st.session_state:
     st.session_state.processing = False
 

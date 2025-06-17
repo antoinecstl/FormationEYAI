@@ -51,7 +51,3 @@ A ChatGPT-like interface for interacting with your PDF documents using Ollama an
 - If you encounter errors when processing PDFs, make sure Ollama is running with `ollama serve`
 - If models are not loading, verify they are installed using `ollama list`
 - Check the console for detailed error messages
-
-## License
-
-MIT

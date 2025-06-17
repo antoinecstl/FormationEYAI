@@ -1,17 +1,13 @@
-# ---- exécution ----
-streamlit>=1.33      
-requests>=2.31
-
-# ---- PDF ----
-PyPDF2>=3.0.1
-
-# ---- LangChain (scission officielle) ----
-pydantic>=2.11.4,<3      # requis par langchain-core ≥0.3.56
-langchain-core>=0.3.60,<0.4        # dernières API
-langchain-community>=0.3.24,<0.4   # version maxi dispo
-langchain-ollama>=0.3.3            # intègre OllamaLLM/OllamaEmbeddings
-langchain-text-splitters>=0.3.8    # utilitaires de découpe
-
-scikit-learn
-# ---- vector store ----
+# Dépendances pour l'application RAG PDF Chat
+streamlit>=1.28.0
 faiss-cpu>=1.7.4
+numpy>=1.24.0
+PyPDF2>=3.0.1
+langchain>=0.1.0
+scikit-learn>=1.3.0
+ollama-python>=0.1.0
+
+# Dépendances optionnelles pour améliorer les performances
+pandas>=2.0.0
+requests>=2.31.0
+typing-extensions>=4.7.0
