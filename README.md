@@ -36,11 +36,11 @@ A ChatGPT-like interface for interacting with your PDF documents using Ollama an
 
 1. Start the application:
    ```bash
-   streamlit run app3.py
+   streamlit run app_finale.py
    ```
    or 
       ```bash
-   python3 -m streamlit run app3.py; 
+   python3 -m streamlit run app_finale.py; 
    ```
 2. Upload your PDF documents using the sidebar
 3. Click "Process PDFs" to analyze the documents
