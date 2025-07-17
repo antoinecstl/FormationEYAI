@@ -65,12 +65,22 @@ MODEL_NAME = "llama3.2:3b"
 EMBEDDING_MODEL = "nomic-embed-text:latest"
 DOC_TOP_K = 3
 CHUNK_TOP_K = 5
-CANDIDATES_K = 20
+CANDIDATES_K = 50  # Augmenté pour plus de diversité
 NEIGHBORS = 1
-LAMBDA_DIVERSITY = 0.3
-SIM_THRESHOLD = 0.25
+LAMBDA_DIVERSITY = 0.4  # Plus de diversité vs similarité pure
+SIM_THRESHOLD = 0.4     # Plus permissif (était 0.25)
 TEMPERATURE = 0.2
 MAX_TOKENS = 2048
+
+# HNSW optimisé pour embeddings 768D
+HNSW_M = 48            # Connectivité (16-64 optimal pour 768D)
+HNSW_EF_CONSTRUCTION = 200  # Qualité construction
+HNSW_EF_SEARCH = 100   # Vitesse/qualité recherche
+FLAT_THRESHOLD = 10000  # Seuil pour passer en IndexFlatIP
+
+# Optimisations avancées
+NEIGHBOR_SIM_RATIO = 0.7  # Seuil pour voisins (70% du seuil principal)
+DOC_FILTER_MULTIPLIER = 5  # Facteur de sur-échantillonnage pour filtrage post-hoc
 
 # --------------------- Helpers LLM ----------------------------------------
 
@@ -151,11 +161,29 @@ class RagIndex:
             for i, txt in enumerate(chunks):
                 self.chunk_meta.append({"doc_id": doc_id, "text": txt, "chunk_id": i})
 
-        self.doc_index = faiss.IndexFlatIP(len(doc_embs[0]))
-        self.doc_index.add(np.vstack(doc_embs).astype("float32"))
+        # Normalisation des embeddings documents pour cosine similarity
+        doc_emb_matrix = np.vstack(doc_embs).astype("float32")
+        doc_emb_matrix = doc_emb_matrix / np.linalg.norm(doc_emb_matrix, axis=1, keepdims=True)
+        
+        self.doc_index = faiss.IndexFlatIP(doc_emb_matrix.shape[1])
+        self.doc_index.add(doc_emb_matrix)
 
+        # Normalisation des embeddings chunks pour cohérence métrique
         self.chunk_emb = np.vstack(chunk_embs_list).astype("float32")
-        self.chunk_index = faiss.IndexHNSWFlat(self.chunk_emb.shape[1], 32)
+        self.chunk_emb = self.chunk_emb / np.linalg.norm(self.chunk_emb, axis=1, keepdims=True)
+        
+        # Choix automatique d'index selon la taille
+        if len(self.chunk_emb) < FLAT_THRESHOLD:
+            # IndexFlatIP pour petites collections (plus précis)
+            self.chunk_index = faiss.IndexFlatIP(self.chunk_emb.shape[1])
+        else:
+            # HNSW optimisé avec métrique INNER_PRODUCT cohérente
+            self.chunk_index = faiss.IndexHNSWFlat(self.chunk_emb.shape[1], 
+                                                  HNSW_M, 
+                                                  faiss.METRIC_INNER_PRODUCT)
+            self.chunk_index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
+            self.chunk_index.hnsw.efSearch = HNSW_EF_SEARCH
+        
         self.chunk_index.add(self.chunk_emb)
 
     def _is_global(self, query: str, thr: float = 0.78) -> bool:
@@ -184,25 +212,86 @@ class RagIndex:
         return selected
 
     def retrieve(self, query: str) -> Tuple[List[str], List[int], Optional[str]]:
+        # Normalisation de la query pour cohérence métrique
         q_emb = embed_texts([query])[0]
+        q_emb = q_emb / np.linalg.norm(q_emb)
+        
+        # 1. Sélection des documents pertinents
         _, I_doc = self.doc_index.search(q_emb[None, :], DOC_TOP_K)
-        allowed = set(I_doc[0])
+        allowed_docs = set(I_doc[0])
 
-        mask = [i for i, m in enumerate(self.chunk_meta) if m["doc_id"] in allowed]
-        sub_emb = self.chunk_emb[mask]
-        sub_idx = faiss.IndexFlatIP(sub_emb.shape[1])
-        sub_idx.add(sub_emb)
-        D, I = sub_idx.search(q_emb[None, :], min(CANDIDATES_K, len(mask)))
-        pool = [mask[idx] for idx in I[0]]
-        pool = [idx for idx, d in zip(pool, D[0]) if 1-d <= SIM_THRESHOLD] or [mask[I[0][0]]]
-
-        cand_emb = self.chunk_emb[pool]
-        selected = [pool[i] for i in self._mmr(q_emb, cand_emb, CHUNK_TOP_K)]
-        expanded = {j for idx in selected for j in range(idx-NEIGHBORS, idx+NEIGHBORS+1)}
-        final = [i for i in expanded if 0 <= i < len(self.chunk_meta)][:CHUNK_TOP_K]
-
+        # 2. Recherche directe dans l'index HNSW/Flat (SANS recréation)
+        if len(allowed_docs) == len(self.doc_meta):
+            # Tous les docs → recherche globale
+            D, I = self.chunk_index.search(q_emb[None, :], CANDIDATES_K)
+            pool_indices = I[0]
+            pool_scores = D[0]
+        else:
+            # Filtrage par document + recherche large puis filtrage
+            # Recherche plus large pour compenser le filtrage post-hoc
+            search_k = min(CANDIDATES_K * 5, len(self.chunk_meta))  # Augmenté de 3→5
+            D, I = self.chunk_index.search(q_emb[None, :], search_k)
+            
+            # Filtrage des chunks par document autorisé
+            filtered_pairs = [(idx, score) for idx, score in zip(I[0], D[0]) 
+                            if self.chunk_meta[idx]["doc_id"] in allowed_docs]
+            
+            if not filtered_pairs:
+                # Fallback: prendre le premier chunk du premier doc autorisé
+                fallback_chunks = [i for i, m in enumerate(self.chunk_meta) 
+                                 if m["doc_id"] in allowed_docs]
+                pool_indices = [fallback_chunks[0]] if fallback_chunks else [0]
+                pool_scores = [0.5]  # Score neutre pour IP normalisé
+            else:
+                pool_indices, pool_scores = zip(*filtered_pairs[:CANDIDATES_K])
+        
+        # 3. Filtrage par seuil de similarité (uniformisé pour IP)
+        # Avec vecteurs normalisés: IP élevé = similaire pour tous les index
+        valid_pairs = [(idx, score) for idx, score in zip(pool_indices, pool_scores) 
+                      if score >= SIM_THRESHOLD]
+        
+        if not valid_pairs:
+            # Fallback: prendre le meilleur candidat
+            valid_pairs = [(pool_indices[0], pool_scores[0])]
+        
+        pool = [idx for idx, _ in valid_pairs]
+        
+        # 4. MMR pour diversifier
+        if len(pool) > CHUNK_TOP_K:
+            cand_emb = self.chunk_emb[pool]
+            selected_mmr = self._mmr(q_emb, cand_emb, CHUNK_TOP_K)
+            selected = [pool[i] for i in selected_mmr]
+        else:
+            selected = pool
+        
+        # 5. Expansion contextuelle intelligente (chunks voisins avec seuil)
+        expanded = set(selected)  # Commencer avec les chunks sélectionnés
+        for idx in selected:
+            for offset in range(-NEIGHBORS, NEIGHBORS + 1):
+                if offset == 0:  # Skip le chunk central (déjà dans selected)
+                    continue
+                neighbor_idx = idx + offset
+                if 0 <= neighbor_idx < len(self.chunk_meta):
+                    # Vérifier que le voisin est du même document
+                    if self.chunk_meta[neighbor_idx]["doc_id"] == self.chunk_meta[idx]["doc_id"]:
+                        # Seuil de similarité pour éviter les voisins non-pertinents
+                        neighbor_sim = float(q_emb @ self.chunk_emb[neighbor_idx])
+                        if neighbor_sim >= SIM_THRESHOLD * 0.7:  # 70% du seuil principal
+                            expanded.add(neighbor_idx)
+        
+        # Trier par score de similarité (ordre décroissant pour IP)
+        final_with_scores = []
+        for idx in expanded:
+            score = float(q_emb @ self.chunk_emb[idx])
+            final_with_scores.append((idx, score))
+        
+        final_with_scores.sort(key=lambda x: x[1], reverse=True)
+        final = [idx for idx, _ in final_with_scores[:CHUNK_TOP_K]]
+        
+        # 6. Extraction des contextes et résumé
         contexts = [self.chunk_meta[i]["text"] for i in final]
         summary = self.doc_meta[int(I_doc[0][0])]["summary"] if self._is_global(query) else None
+        
         return contexts, final, summary
 
 # ---------------- Prompt builder -----------------------------------------
@@ -289,16 +378,21 @@ if query:
     st.session_state.messages.append({"role": "user", "content": query})
     # Réafficher l'entrée de l'utilisateur dans le style amélioré
     st.markdown(f'<div class="user-msg">{query}</div>', unsafe_allow_html=True)
-    st.session_state.processing = True  # <- correctif
+    st.session_state.processing = True
 
     rag: RagIndex = st.session_state.rag  # type: ignore
-    contexts, indices, summary = rag.retrieve(query)
     
+    # Récupération des contextes avec feedback visuel
+    with st.spinner("🔍 Recherche des passages pertinents..."):
+        contexts, indices, summary = rag.retrieve(query)
+    
+    # Construction du prompt
     prompt = build_prompt(query, contexts, summary, st.session_state.messages)
 
     placeholder = st.empty()
     collected_parts: List[str] = []
 
+    # Génération en streaming
     for chunk in _call_llm(prompt, temperature=TEMPERATURE, max_tokens=MAX_TOKENS, stream=True):
         token = chunk["message"]["content"]
         collected_parts.append(token)
