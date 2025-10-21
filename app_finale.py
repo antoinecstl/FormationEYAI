@@ -61,7 +61,7 @@ html, body {
 )
 
 # --------------------- Config ---------------------------------------------
-MODEL_NAME = "llama3.2:3b"
+MODEL_NAME = "llama3.2:latest"
 EMBEDDING_MODEL = "nomic-embed-text:latest"
 DOC_TOP_K = 3
 CHUNK_TOP_K = 5
